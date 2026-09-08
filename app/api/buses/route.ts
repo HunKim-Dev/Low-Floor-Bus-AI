@@ -59,11 +59,14 @@ function toText(value: unknown) {
 
 export async function GET(request: Request) {
   const requestUrl = new URL(request.url);
-  const requestedRoute = requestUrl.searchParams.get('route') || '271';
+  const requestedRoute = requestUrl.searchParams.has('route')
+    ? (requestUrl.searchParams.get('route') ?? '')
+    : '271';
   const requestedNode = requestUrl.searchParams.get('nodeId') || '';
   const apiKey = process.env.TAGO_BUS_API_KEY;
-  const cityCode = process.env.TAGO_CITY_CODE;
-  const configuredNode = process.env.TAGO_NODE_ID || requestedNode;
+  const cityCode =
+    requestUrl.searchParams.get('cityCode') || process.env.TAGO_CITY_CODE;
+  const configuredNode = requestedNode || process.env.TAGO_NODE_ID;
 
   if (
     !apiKey ||
@@ -74,7 +77,7 @@ export async function GET(request: Request) {
     return NextResponse.json({
       mode: 'demo',
       refreshedAt: new Date().toISOString(),
-      buses: createDemoBuses(requestedRoute),
+      buses: createDemoBuses(requestedRoute || '271'),
     });
   }
 
@@ -91,8 +94,8 @@ export async function GET(request: Request) {
 
     const response = await fetch(apiUrl, {
       headers: { Accept: 'application/json' },
-      cf: { cacheTtl: 20, cacheEverything: true },
-    } as RequestInit);
+      cache: 'no-store',
+    });
     if (!response.ok) throw new Error('TAGO request failed');
     const payload = (await response.json()) as {
       response?: {
@@ -133,7 +136,7 @@ export async function GET(request: Request) {
       mode: 'demo',
       refreshedAt: new Date().toISOString(),
       notice: '실시간 데이터를 불러오지 못해 시연 데이터로 전환했습니다.',
-      buses: createDemoBuses(requestedRoute),
+      buses: createDemoBuses(requestedRoute || '271'),
     });
   }
 }

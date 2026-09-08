@@ -12,6 +12,7 @@ import {
   Download,
   History,
   LoaderCircle,
+  LocateFixed,
   MapPin,
   Mic,
   Navigation,
@@ -36,6 +37,7 @@ import {
 import { Progress } from '@/components/ui/progress';
 import { Slider } from '@/components/ui/slider';
 import { Switch } from '@/components/ui/switch';
+import { demoStops, type TransitStop } from '@/lib/demo-stops';
 
 type BusCandidate = {
   id: string;
@@ -52,13 +54,8 @@ type Settings = {
   safetyMinutes: number;
   voiceAlerts: boolean;
   vibrationAlerts: boolean;
-};
-
-type Stop = {
-  id: string;
-  name: string;
-  direction: string;
-  route: string;
+  voiceRate: number;
+  voiceURI: string;
 };
 
 type RecognitionEventLike = {
@@ -131,22 +128,6 @@ declare global {
   }
 }
 
-const stops: Stop[] = [
-  {
-    id: 'demo-sinchon',
-    name: '신촌로터리',
-    direction: '홍대입구 방향',
-    route: '271',
-  },
-  {
-    id: 'demo-seoul',
-    name: '서울역버스환승센터',
-    direction: '만리동 방향',
-    route: '701',
-  },
-  { id: 'demo-gangnam', name: '강남역', direction: '양재 방향', route: '3412' },
-];
-
 const defaultBuses: BusCandidate[] = [
   {
     id: 'general-1',
@@ -188,7 +169,19 @@ const defaultSettings: Settings = {
   safetyMinutes: 2,
   voiceAlerts: true,
   vibrationAlerts: true,
+  voiceRate: 0.86,
+  voiceURI: '',
 };
+
+function getVoiceQualityScore(voice: SpeechSynthesisVoice) {
+  const name = voice.name.toLowerCase();
+  let score = voice.default ? 2 : 0;
+  if (voice.localService) score += 1;
+  if (/premium|enhanced|natural|neural/.test(name)) score += 12;
+  if (/yuna|유나|sora|소라/.test(name)) score += 8;
+  if (/google/.test(name)) score += 6;
+  return score;
+}
 
 function formatClock(minutesFromNow: number, baseTime: number | null) {
   if (baseTime === null) return '계산 중';
@@ -213,7 +206,11 @@ function getRecommendation(buses: BusCandidate[], settings: Settings) {
 }
 
 export default function BusApp() {
-  const [selectedStop, setSelectedStop] = useState(stops[0]);
+  const [selectedStop, setSelectedStop] = useState(demoStops[0]);
+  const [availableStops, setAvailableStops] =
+    useState<TransitStop[]>(demoStops);
+  const [stopQuery, setStopQuery] = useState('');
+  const [nearbyBusy, setNearbyBusy] = useState(false);
   const [buses, setBuses] = useState<BusCandidate[]>(defaultBuses);
   const [settings, setSettings] = useState<Settings>(defaultSettings);
   const [dataMode, setDataMode] = useState<'demo' | 'live'>('demo');
@@ -249,6 +246,25 @@ export default function BusApp() {
     },
     { label: '맞춤 안내', detail: '출발 시각과 이유 설명', status: 'waiting' },
   ]);
+  const [availableVoices, setAvailableVoices] = useState<
+    SpeechSynthesisVoice[]
+  >([]);
+  const visibleStops = useMemo(() => {
+    const query = stopQuery.trim().toLowerCase();
+    if (!query) return availableStops;
+    return availableStops.filter(
+      (stop) =>
+        stop.name.toLowerCase().includes(query) ||
+        stop.route.toLowerCase().includes(query),
+    );
+  }, [availableStops, stopQuery]);
+  const koreanVoiceOptions = useMemo(
+    () =>
+      availableVoices
+        .filter((voice) => voice.lang.toLowerCase().startsWith('ko'))
+        .sort((a, b) => getVoiceQualityScore(b) - getVoiceQualityScore(a)),
+    [availableVoices],
+  );
 
   const result = useMemo(
     () => getRecommendation(buses, settings),
@@ -283,12 +299,31 @@ export default function BusApp() {
         return;
       }
       window.speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(message);
-      utterance.lang = 'ko-KR';
-      utterance.rate = 0.95;
-      window.speechSynthesis.speak(utterance);
+      const koreanVoices = availableVoices
+        .filter((voice) => voice.lang.toLowerCase().startsWith('ko'))
+        .sort((a, b) => getVoiceQualityScore(b) - getVoiceQualityScore(a));
+      const selectedVoice =
+        koreanVoices.find((voice) => voice.voiceURI === settings.voiceURI) ??
+        koreanVoices[0];
+      const sentences = message
+        .match(/[^.!?。]+[.!?。]?/g)
+        ?.map((sentence) => sentence.trim()) ?? [message];
+      sentences.filter(Boolean).forEach((sentence) => {
+        const utterance = new SpeechSynthesisUtterance(sentence);
+        utterance.lang = 'ko-KR';
+        utterance.voice = selectedVoice ?? null;
+        utterance.rate = settings.voiceRate;
+        utterance.pitch = 1.02;
+        utterance.volume = 0.92;
+        window.speechSynthesis.speak(utterance);
+      });
     },
-    [settings.voiceAlerts],
+    [
+      availableVoices,
+      settings.voiceAlerts,
+      settings.voiceRate,
+      settings.voiceURI,
+    ],
   );
 
   const notify = useCallback(
@@ -345,6 +380,13 @@ export default function BusApp() {
     if ('serviceWorker' in navigator) {
       void navigator.serviceWorker.register('/sw.js');
     }
+    const loadVoices = () => {
+      if ('speechSynthesis' in window) {
+        setAvailableVoices(window.speechSynthesis.getVoices());
+      }
+    };
+    loadVoices();
+    window.speechSynthesis?.addEventListener('voiceschanged', loadVoices);
     const handleInstall = (event: Event) => {
       event.preventDefault();
       setInstallPrompt(event as InstallPromptEvent);
@@ -353,6 +395,7 @@ export default function BusApp() {
     return () => {
       window.cancelAnimationFrame(initializationFrame);
       window.clearInterval(clockTimer);
+      window.speechSynthesis?.removeEventListener('voiceschanged', loadVoices);
       window.removeEventListener('beforeinstallprompt', handleInstall);
     };
   }, []);
@@ -372,7 +415,9 @@ export default function BusApp() {
           '/api/buses?route=' +
           encodeURIComponent(selectedStop.route) +
           '&nodeId=' +
-          encodeURIComponent(selectedStop.id);
+          encodeURIComponent(selectedStop.id) +
+          '&cityCode=' +
+          encodeURIComponent(selectedStop.cityCode ?? '');
         const response = await fetch(requestUrl, { signal: controller.signal });
         if (!response.ok) throw new Error('bus fetch failed');
         const payload = (await response.json()) as {
@@ -389,7 +434,10 @@ export default function BusApp() {
       } catch (error) {
         if ((error as Error).name !== 'AbortError') {
           setBuses(
-            defaultBuses.map((bus) => ({ ...bus, route: selectedStop.route })),
+            defaultBuses.map((bus) => ({
+              ...bus,
+              route: selectedStop.route || '271',
+            })),
           );
           setDataMode('demo');
           setStatusMessage('실시간 연결이 어려워 시연 데이터로 전환했어요.');
@@ -526,6 +574,58 @@ export default function BusApp() {
     return () => lifecycle.abort();
   }, [buses, settings, startAlerts]);
 
+  const loadNearbyStops = () => {
+    if (!('geolocation' in navigator)) {
+      setStatusMessage('이 기기에서는 현재 위치 확인을 지원하지 않아요.');
+      return;
+    }
+    setNearbyBusy(true);
+    setStatusMessage('현재 위치에서 가까운 정류장을 찾고 있어요.');
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        const requestUrl =
+          '/api/stops?lat=' +
+          encodeURIComponent(position.coords.latitude) +
+          '&lng=' +
+          encodeURIComponent(position.coords.longitude);
+        void fetch(requestUrl)
+          .then(async (response) => {
+            if (!response.ok) throw new Error('stop fetch failed');
+            return (await response.json()) as {
+              mode: 'demo' | 'live';
+              stops: TransitStop[];
+            };
+          })
+          .then((payload) => {
+            setAvailableStops(
+              payload.stops.length > 0 ? payload.stops : demoStops,
+            );
+            setStopQuery('');
+            setStatusMessage(
+              payload.mode === 'live'
+                ? '내 주변 500m 정류장을 거리순으로 불러왔어요.'
+                : 'API 키가 없어 여러 시연 정류장을 보여드려요.',
+            );
+          })
+          .catch(() => {
+            setAvailableStops(demoStops);
+            setStatusMessage(
+              '주변 정류장 조회가 어려워 시연 목록을 보여드려요.',
+            );
+          })
+          .finally(() => setNearbyBusy(false));
+      },
+      () => {
+        setNearbyBusy(false);
+        setAvailableStops(demoStops);
+        setStatusMessage(
+          '위치 권한이 없어 검색 가능한 시연 정류장을 보여드려요.',
+        );
+      },
+      { enableHighAccuracy: true, timeout: 10_000, maximumAge: 60_000 },
+    );
+  };
+
   const runAssistant = async (message: string) => {
     const cleanMessage = message.trim();
     if (!cleanMessage || assistantBusy) return;
@@ -539,7 +639,7 @@ export default function BusApp() {
         body: JSON.stringify({
           message: cleanMessage,
           currentStop: selectedStop,
-          availableStops: stops,
+          availableStops,
           settings,
         }),
       });
@@ -550,7 +650,7 @@ export default function BusApp() {
         throw new Error(payload.error ?? 'assistant request failed');
 
       if (payload.changes.stopId) {
-        const nextStop = stops.find(
+        const nextStop = availableStops.find(
           (stop) => stop.id === payload.changes.stopId,
         );
         if (nextStop) {
@@ -1070,17 +1170,45 @@ export default function BusApp() {
       </div>
 
       <Dialog open={stopsOpen} onOpenChange={setStopsOpen}>
-        <DialogContent className="max-h-[80dvh] rounded-[1.75rem] p-5 sm:max-w-md">
+        <DialogContent className="max-h-[88dvh] overflow-y-auto rounded-[1.75rem] p-5 sm:max-w-md">
           <DialogHeader>
             <DialogTitle className="text-xl font-black">
               이용 정류장 선택
             </DialogTitle>
             <DialogDescription>
-              자주 이용하는 정류장과 진행 방향을 선택하세요.
+              내 주변 정류장을 찾거나 이름과 버스 번호로 검색하세요.
             </DialogDescription>
           </DialogHeader>
+          <Button
+            type="button"
+            className="h-12 w-full rounded-2xl bg-[#10233f] font-black"
+            onClick={loadNearbyStops}
+            disabled={nearbyBusy}
+          >
+            {nearbyBusy ? (
+              <LoaderCircle aria-hidden="true" className="animate-spin" />
+            ) : (
+              <LocateFixed aria-hidden="true" />
+            )}
+            {nearbyBusy ? '내 주변을 찾는 중…' : '현재 위치로 주변 정류장 찾기'}
+          </Button>
+          <div>
+            <label htmlFor="stop-search" className="sr-only">
+              정류장 또는 버스 번호 검색
+            </label>
+            <input
+              id="stop-search"
+              value={stopQuery}
+              onChange={(event) => setStopQuery(event.target.value)}
+              placeholder="정류장 이름 또는 버스 번호"
+              className="min-h-12 w-full rounded-2xl border border-[#dce4ec] bg-[#f7f9fb] px-4 text-base font-semibold placeholder:text-[#8292a6] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#4478b1]"
+            />
+          </div>
+          <p className="text-xs font-semibold text-[#71839a]">
+            {availableStops.length}개 정류장 · 위치를 허용하면 반경 500m 거리순
+          </p>
           <div className="grid gap-2">
-            {stops.map((stop) => {
+            {visibleStops.map((stop) => {
               const selected = selectedStop.id === stop.id;
               return (
                 <button
@@ -1099,18 +1227,28 @@ export default function BusApp() {
                   }
                 >
                   <span className="grid size-10 place-items-center rounded-xl bg-[#e8f9c6] font-black text-[#356415]">
-                    {stop.route}
+                    {stop.route || (
+                      <MapPin aria-hidden="true" className="size-5" />
+                    )}
                   </span>
                   <span className="flex-1">
                     <span className="block font-black">{stop.name}</span>
                     <span className="text-sm font-medium text-[#6f829a]">
                       {stop.direction}
+                      {stop.distanceMeters !== undefined
+                        ? ' · ' + stop.distanceMeters + 'm'
+                        : ''}
                     </span>
                   </span>
                   {selected && <Check aria-hidden="true" className="size-5" />}
                 </button>
               );
             })}
+            {visibleStops.length === 0 && (
+              <div className="rounded-2xl bg-[#f1f5f8] p-5 text-center text-sm font-bold text-[#59708d]">
+                검색 결과가 없어요. 다른 이름이나 버스 번호를 입력해 주세요.
+              </div>
+            )}
           </div>
         </DialogContent>
       </Dialog>
@@ -1159,6 +1297,81 @@ export default function BusApp() {
                 setSettings((current) => ({ ...current, safetyMinutes: value }))
               }
             />
+
+            <div className="rounded-2xl border border-[#dce4ec] bg-[#f7f9fb] p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <label htmlFor="voice-choice" className="font-black">
+                    안내 목소리
+                  </label>
+                  <p className="mt-0.5 text-sm font-medium text-[#71839a]">
+                    기기에서 가장 자연스러운 한국어 음성을 우선해요
+                  </p>
+                </div>
+                <Volume2
+                  aria-hidden="true"
+                  className="mt-1 size-5 text-[#356415]"
+                />
+              </div>
+              <select
+                id="voice-choice"
+                value={settings.voiceURI}
+                onChange={(event) =>
+                  setSettings((current) => ({
+                    ...current,
+                    voiceURI: event.target.value,
+                  }))
+                }
+                className="mt-3 min-h-11 w-full rounded-xl border border-[#cad6e2] bg-white px-3 text-sm font-bold"
+              >
+                <option value="">자동 · 가장 자연스러운 목소리</option>
+                {koreanVoiceOptions.map((voice) => (
+                  <option key={voice.voiceURI} value={voice.voiceURI}>
+                    {voice.name}
+                  </option>
+                ))}
+              </select>
+              <div className="mt-4 flex items-center justify-between gap-3">
+                <label htmlFor="voice-rate" className="text-sm font-black">
+                  말하기 속도
+                </label>
+                <span className="text-sm font-bold text-[#59708d]">
+                  {settings.voiceRate < 0.84
+                    ? '차분하게'
+                    : settings.voiceRate < 0.94
+                      ? '부드럽게'
+                      : '보통'}
+                </span>
+              </div>
+              <Slider
+                id="voice-rate"
+                className="mt-3 [&_[data-slot=slider-track]]:h-2 [&_[data-slot=slider-thumb]]:size-5"
+                min={0.76}
+                max={1}
+                step={0.02}
+                value={[settings.voiceRate]}
+                onValueChange={(next) =>
+                  setSettings((current) => ({
+                    ...current,
+                    voiceRate: Array.isArray(next) ? next[0] : next,
+                  }))
+                }
+                aria-label="안내 목소리 속도"
+              />
+              <Button
+                type="button"
+                variant="outline"
+                className="mt-4 h-11 w-full rounded-xl font-black"
+                onClick={() =>
+                  announce(
+                    '안녕하세요. 서두르지 않아도 괜찮아요. 출발할 시간을 편안하게 알려드릴게요.',
+                  )
+                }
+              >
+                <Volume2 aria-hidden="true" />
+                이 목소리 들어보기
+              </Button>
+            </div>
 
             <div className="divide-y divide-[#e2e8ef] rounded-2xl border border-[#dce4ec]">
               <div className="flex min-h-14 items-center justify-between gap-4 px-4">
