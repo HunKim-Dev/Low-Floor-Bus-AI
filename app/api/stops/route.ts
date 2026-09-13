@@ -40,7 +40,14 @@ export async function GET(request: Request) {
   const latitude = Number(requestUrl.searchParams.get('lat'));
   const longitude = Number(requestUrl.searchParams.get('lng'));
   const hasCoordinates =
-    Number.isFinite(latitude) && Number.isFinite(longitude);
+    requestUrl.searchParams.has('lat') &&
+    requestUrl.searchParams.has('lng') &&
+    Number.isFinite(latitude) &&
+    Number.isFinite(longitude) &&
+    latitude >= -90 &&
+    latitude <= 90 &&
+    longitude >= -180 &&
+    longitude <= 180;
   const apiKey = process.env.TAGO_BUS_API_KEY;
 
   if (apiKey && hasCoordinates) {
@@ -58,6 +65,7 @@ export async function GET(request: Request) {
       const response = await fetch(apiUrl, {
         headers: { Accept: 'application/json' },
         cache: 'no-store',
+        signal: AbortSignal.timeout(7_000),
       });
       if (!response.ok) throw new Error('TAGO stop request failed');
       const payload = (await response.json()) as {
@@ -107,5 +115,12 @@ export async function GET(request: Request) {
       stop.name.toLowerCase().includes(query) ||
       stop.route.toLowerCase().includes(query),
   );
-  return NextResponse.json({ mode: 'demo', radiusMeters: 500, stops });
+  return hasCoordinates
+    ? NextResponse.json({
+        mode: 'unavailable',
+        radiusMeters: 500,
+        stops: [],
+        notice: '현재 위치 주변 정류장을 확인하지 못했어요.',
+      })
+    : NextResponse.json({ mode: 'demo', radiusMeters: 500, stops });
 }

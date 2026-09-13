@@ -4,6 +4,7 @@ type NormalizedBus = {
   id: string;
   route: string;
   etaMinutes: number;
+  etaSeconds?: number;
   stopsAway: number;
   lowFloor: boolean;
   congestion: '여유' | '보통' | '혼잡' | '정보 없음';
@@ -63,21 +64,26 @@ export async function GET(request: Request) {
     ? (requestUrl.searchParams.get('route') ?? '')
     : '271';
   const requestedNode = requestUrl.searchParams.get('nodeId') || '';
+  const demoRequested = requestUrl.searchParams.get('demo') === '1';
   const apiKey = process.env.TAGO_BUS_API_KEY;
   const cityCode =
     requestUrl.searchParams.get('cityCode') || process.env.TAGO_CITY_CODE;
   const configuredNode = requestedNode || process.env.TAGO_NODE_ID;
 
-  if (
-    !apiKey ||
-    !cityCode ||
-    !configuredNode ||
-    configuredNode.startsWith('demo-')
-  ) {
+  if (demoRequested || configuredNode?.startsWith('demo-')) {
     return NextResponse.json({
       mode: 'demo',
       refreshedAt: new Date().toISOString(),
       buses: createDemoBuses(requestedRoute || '271'),
+    });
+  }
+
+  if (!apiKey || !cityCode || !configuredNode) {
+    return NextResponse.json({
+      mode: 'unavailable',
+      refreshedAt: new Date().toISOString(),
+      notice: '실시간 저상버스 도착정보를 확인할 수 없습니다.',
+      buses: [],
     });
   }
 
@@ -95,6 +101,7 @@ export async function GET(request: Request) {
     const response = await fetch(apiUrl, {
       headers: { Accept: 'application/json' },
       cache: 'no-store',
+      signal: AbortSignal.timeout(7_000),
     });
     if (!response.ok) throw new Error('TAGO request failed');
     const payload = (await response.json()) as {
@@ -114,7 +121,8 @@ export async function GET(request: Request) {
         return {
           id: (toText(item.routeid) || route) + '-' + index,
           route,
-          etaMinutes: Math.max(1, Math.ceil(etaSeconds / 60)),
+          etaMinutes: etaSeconds / 60,
+          etaSeconds,
           stopsAway: Math.max(0, Number(item.arrprevstationcnt) || 0),
           lowFloor: toText(item.vehicletp).includes('저상'),
           congestion: '정보 없음',
@@ -122,9 +130,13 @@ export async function GET(request: Request) {
       })
       .filter((bus): bus is NormalizedBus => bus !== null);
 
-    if (buses.length === 0) {
-      throw new Error('No matching bus data');
-    }
+    if (buses.length === 0)
+      return NextResponse.json({
+        mode: 'unavailable',
+        refreshedAt: new Date().toISOString(),
+        notice: '이 노선의 실시간 저상버스 도착정보가 없습니다.',
+        buses: [],
+      });
 
     return NextResponse.json({
       mode: 'live',
@@ -133,10 +145,10 @@ export async function GET(request: Request) {
     });
   } catch {
     return NextResponse.json({
-      mode: 'demo',
+      mode: 'unavailable',
       refreshedAt: new Date().toISOString(),
-      notice: '실시간 데이터를 불러오지 못해 시연 데이터로 전환했습니다.',
-      buses: createDemoBuses(requestedRoute || '271'),
+      notice: '실시간 저상버스 도착정보를 불러오지 못했습니다.',
+      buses: [],
     });
   }
 }

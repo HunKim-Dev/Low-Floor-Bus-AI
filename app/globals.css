@@ -51,11 +51,19 @@
 body {
   font-family:
     Pretendard, 'Apple SD Gothic Neo', 'Noto Sans KR', system-ui, sans-serif;
+  letter-spacing: -0.015em;
+  text-rendering: optimizeLegibility;
   margin: 0;
   min-width: 320px;
   min-height: 100dvh;
   overscroll-behavior-y: none;
   -webkit-tap-highlight-color: transparent;
+}
+
+button,
+input,
+select {
+  font: inherit;
 }
 
 button,
@@ -76,24 +84,24 @@ input {
 }
 
 :root {
-  --background: #f7f9fb;
-  --foreground: #10233f;
+  --background: #f9fafb;
+  --foreground: #191f28;
   --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
+  --card-foreground: #191f28;
   --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: #10233f;
+  --popover-foreground: #191f28;
+  --primary: #2165d6;
   --primary-foreground: #ffffff;
-  --secondary: oklch(0.97 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.556 0 0);
-  --accent: oklch(0.97 0 0);
-  --accent-foreground: oklch(0.205 0 0);
+  --secondary: #f2f4f6;
+  --secondary-foreground: #333d4b;
+  --muted: #f2f4f6;
+  --muted-foreground: #6b7684;
+  --accent: #f2f4f6;
+  --accent-foreground: #333d4b;
   --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: #4478b1;
+  --border: #e5e8eb;
+  --input: #e5e8eb;
+  --ring: #2165d6;
   --chart-1: oklch(0.87 0 0);
   --chart-2: oklch(0.556 0 0);
   --chart-3: oklch(0.439 0 0);

@@ -1,5 +1,5 @@
 {
-  "name": "bus-majung-ai",
+  "name": "low-floor-bus-ai",
   "version": "0.1.0",
   "private": true,
   "engines": {
@@ -10,6 +10,7 @@
     "build": "next build --webpack",
     "start": "next start",
     "lint": "oxlint",
+    "test": "node --experimental-strip-types --test tests/*.test.mjs",
     "format": "oxfmt"
   },
   "dependencies": {
