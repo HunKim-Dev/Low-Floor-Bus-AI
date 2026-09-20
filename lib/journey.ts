@@ -7,7 +7,6 @@ export type Settings = {
   voiceAlerts: boolean;
   vibrationAlerts: boolean;
   voiceRate: number;
-  voiceURI: string;
 };
 
 export const defaultSettings: Settings = {
@@ -19,7 +18,6 @@ export const defaultSettings: Settings = {
   voiceAlerts: true,
   vibrationAlerts: true,
   voiceRate: 0.98,
-  voiceURI: '',
 };
 
 export function restoreSettings(value: unknown): Settings {
@@ -52,8 +50,7 @@ export function restoreSettings(value: unknown): Settings {
   ] as const) {
     if (typeof saved[key] === 'boolean') result[key] = saved[key];
   }
-  if (typeof saved.voiceURI === 'string')
-    result.voiceURI = saved.voiceURI.slice(0, 500);
+  // Ignore legacy voiceOutput/voiceURI preferences: all TTS now uses Gemini.
   return result;
 }
 

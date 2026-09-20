@@ -1,42 +1,33 @@
-import { interpretVoice } from '@/lib/voice-intent';
+import { interpretCloudflareVoice } from '../../../lib/cloudflare-voice-intent.ts';
+import { cloudflareSettings } from '../../../lib/cloudflare-ai.ts';
+import {
+  assertSameOrigin,
+  createRequestGuard,
+  InputError,
+  privateJson,
+  readLimitedBody,
+} from '../../../lib/api-input.ts';
 
 export const runtime = 'nodejs';
 export const maxDuration = 15;
 
 // Best-effort instance-wide cost guard, not distributed abuse protection.
-let windowStart = 0;
-let requests = 0;
+const guard = createRequestGuard(30);
 
 export async function POST(request: Request) {
-  const reply = (body: unknown, status = 200) =>
-    Response.json(body, { status, headers: { 'Cache-Control': 'no-store' } });
-  const origin = request.headers.get('origin');
-  if (
-    (origin && origin !== new URL(request.url).origin) ||
-    request.headers.get('sec-fetch-site') === 'cross-site'
-  ) {
+  const reply = privateJson;
+  try {
+    assertSameOrigin(request);
+  } catch {
     return reply({ error: '이 앱에서 다시 요청해 주세요.' }, 403);
   }
   if (!request.headers.get('content-type')?.includes('application/json'))
     return reply({ error: 'JSON 요청이 필요해요.' }, 415);
   let body;
   try {
-    const reader = request.body?.getReader();
-    if (!reader) throw new Error('empty body');
-    const decoder = new TextDecoder();
-    let size = 0;
-    let text = '';
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      size += value.byteLength;
-      if (size > 4_096) {
-        await reader.cancel();
-        throw new Error('too large');
-      }
-      text += decoder.decode(value, { stream: true });
-    }
-    body = JSON.parse(text + decoder.decode());
+    body = JSON.parse(
+      new TextDecoder().decode(await readLimitedBody(request, 4096)),
+    );
     if (
       !body ||
       typeof body !== 'object' ||
@@ -47,27 +38,28 @@ export async function POST(request: Request) {
       ![null, undefined, 'origin', 'destination'].includes(body.pendingSlot)
     )
       throw new Error('invalid body');
-  } catch {
+  } catch (error) {
+    if (error instanceof InputError)
+      return reply({ error: error.message }, error.status);
     return reply({ error: '말한 내용은 300자 이내로 입력해 주세요.' }, 400);
   }
-  if (Date.now() - windowStart > 60_000) {
-    windowStart = Date.now();
-    requests = 0;
-  }
-  if (++requests > 30)
-    return reply({ error: '요청이 많아요. 잠시 후 다시 말해 주세요.' }, 429);
   try {
+    guard();
+    const config = cloudflareSettings();
     return reply(
-      await interpretVoice(body.message.trim(), body.pendingSlot ?? null, {
-        apiKey:
-          process.env.VOICE_AI_ENABLED === 'true'
-            ? process.env.OPENAI_API_KEY
-            : undefined,
-        model: process.env.OPENAI_VOICE_INTENT_MODEL,
-        signal: request.signal,
-      }),
+      await interpretCloudflareVoice(
+        body.message.trim(),
+        body.pendingSlot ?? null,
+        {
+          ...(config.intentEnabled ? config : {}),
+          model: config.intentModel,
+          signal: request.signal,
+        },
+      ),
     );
-  } catch {
+  } catch (error) {
+    if (error instanceof InputError)
+      return reply({ error: error.message }, error.status);
     return reply({ error: '요청이 취소됐어요.' }, 408);
   }
 }

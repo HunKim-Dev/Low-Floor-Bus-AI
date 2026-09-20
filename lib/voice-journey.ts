@@ -1,4 +1,5 @@
 import type { Place } from './trip-planning.ts';
+import type { TimingPatch } from './voice-command.ts';
 import { locationErrorMessage } from './current-location.ts';
 import type { PlaceSearchResult } from './place-search.ts';
 import {
@@ -12,6 +13,7 @@ export type VoiceDraft = RouteQueries & {
   origin: Place | null;
   destination: Place | null;
   pendingSlot: VoiceSlot | null;
+  settingsPatch?: TimingPatch;
 };
 
 export function mergeVoiceDraft(
@@ -19,6 +21,7 @@ export function mergeVoiceDraft(
   queries: RouteQueries,
   origin: Place | null,
   destination: Place | null,
+  settingsPatch: TimingPatch = {},
 ): VoiceDraft {
   const draft = previous
     ? { ...previous }
@@ -37,7 +40,10 @@ export function mergeVoiceDraft(
     draft.destinationQuery = queries.destinationQuery;
     draft.destination = null;
   }
-  return draft;
+  return {
+    ...draft,
+    settingsPatch: { ...previous?.settingsPatch, ...settingsPatch },
+  };
 }
 
 export function candidateFromSpeech(

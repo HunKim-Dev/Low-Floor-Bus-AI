@@ -26,12 +26,15 @@ import {
   type PointerEvent as ReactPointerEvent,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from 'react';
 
 import { Button } from '@/components/ui/button';
+import { BoardingGuide } from '@/components/boarding-guide';
+import { boardingGuidance } from '@/lib/boarding-guidance';
 import {
   Dialog,
   DialogContent,
@@ -41,7 +44,7 @@ import {
 } from '@/components/ui/dialog';
 import { Switch } from '@/components/ui/switch';
 import type { TransitStop } from '@/lib/demo-stops';
-import { parseRouteFollowUp, placeSearchFailure } from '@/lib/voice-route';
+import { placeSearchFailure } from '@/lib/voice-route';
 import {
   mergeVoiceDraft,
   resolveVoiceDraft,
@@ -49,7 +52,28 @@ import {
   type VoiceDraft,
 } from '@/lib/voice-journey';
 import type { PlaceSearchResult } from '@/lib/place-search';
-import type { VoiceIntent } from '@/lib/voice-intent';
+import {
+  createSpeechPlayer,
+  type SpeechPlayer,
+  type SpeechState,
+} from '@/lib/speech-player';
+import { alertSpeechText } from '@/lib/speech-text';
+import {
+  localVoiceCommand,
+  validateVoiceCommand,
+  applyTimingPatch,
+  timingPatchText,
+} from '@/lib/voice-command';
+import {
+  departureGuidance,
+  type DepartureSnapshot,
+} from '@/lib/departure-guidance';
+import {
+  createAudioRecording,
+  recordingBlobToWav,
+  supportsCloudRecording,
+  type RecordingController,
+} from '@/lib/audio-recorder';
 import {
   getCurrentLocation,
   locationErrorMessage,
@@ -105,28 +129,6 @@ type InstallPromptEvent = Event & {
   userChoice: Promise<{ outcome: 'accepted' | 'dismissed' }>;
 };
 
-type AgentTraceStep = {
-  label: string;
-  detail: string;
-  status: 'complete' | 'attention' | 'waiting';
-};
-
-type AssistantResponse = {
-  mode: 'local-agent' | 'model';
-  intent: 'clarify_stop' | 'clarify_destination' | 'recommend_accessible_bus';
-  changes: {
-    stopId?: string;
-    originPlaceId?: string;
-    destinationPlaceId?: string;
-    preparationMinutes?: number;
-    travelMinutes?: number;
-    safetyMinutes?: number;
-  };
-  responseText: string;
-  needsClarification: boolean;
-  trace: AgentTraceStep[];
-};
-
 type WebMcpTool = {
   name: string;
   title: string;
@@ -157,16 +159,6 @@ declare global {
 }
 
 const initialDemoTrip = createDemoTrip(demoPlaces[0], demoPlaces[1]);
-
-function getVoiceQualityScore(voice: SpeechSynthesisVoice) {
-  const name = voice.name.toLowerCase();
-  let score = voice.default ? 2 : 0;
-  if (voice.localService) score += 1;
-  if (/premium|enhanced|natural|neural/.test(name)) score += 12;
-  if (/yuna|유나|sora|소라/.test(name)) score += 8;
-  if (/google/.test(name)) score += 6;
-  return score;
-}
 
 function formatClock(minutesFromNow: number, baseTime: number | null) {
   if (baseTime === null) return '계산 중';
@@ -227,7 +219,13 @@ function isSamePlace(first: Place, second: Place) {
   );
 }
 
-export default function BusApp() {
+export default function BusApp({
+  cloudSpeechEnabled = false,
+  cloudTtsEnabled = false,
+}: {
+  cloudSpeechEnabled?: boolean;
+  cloudTtsEnabled?: boolean;
+}) {
   const [origin, setOrigin] = useState<Place>({
     ...demoPlaces[0],
     id: 'unset',
@@ -247,6 +245,7 @@ export default function BusApp() {
     direction: initialDemoTrip.direction,
     route: initialDemoTrip.route,
     cityCode: initialDemoTrip.boardingStop.cityCode,
+    routeId: initialDemoTrip.routeId,
   }));
   const [placePicker, setPlacePicker] = useState<
     'origin' | 'destination' | null
@@ -277,6 +276,24 @@ export default function BusApp() {
   const [notice, setNotice] = useState<string | null>(null);
   const [tapToTalk, setTapToTalk] = useState(false);
   const [listening, setListening] = useState(false);
+  const speechPlayerRef = useRef<SpeechPlayer | null>(null);
+  const [speechState, setSpeechState] = useState<SpeechState>({
+    phase: 'idle',
+    source: null,
+  });
+  const speechBusy = speechState.phase !== 'idle';
+  const [speechError, setSpeechError] = useState<string | null>(null);
+  const [cloudPhase, setCloudPhase] = useState<
+    'idle' | 'starting' | 'recording' | 'transcribing'
+  >('idle');
+  const [browserVoiceFallback, setBrowserVoiceFallback] = useState(false);
+  const [cloudVoiceFailed, setCloudVoiceFailed] = useState(false);
+  const recordingRef = useRef<RecordingController | null>(null);
+  const transcriptionRequestRef = useRef<AbortController | null>(null);
+  const pendingGuidanceRef = useRef<{
+    originId: string;
+    destinationId: string;
+  } | null>(null);
   const [statusMessage, setStatusMessage] = useState('도착지를 선택해 주세요.');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [assistantOpen, setAssistantOpen] = useState(false);
@@ -288,6 +305,7 @@ export default function BusApp() {
   const [clockNow, setClockNow] = useState<number | null>(null);
   const [assistantInput, setAssistantInput] = useState('');
   const [assistantBusy, setAssistantBusy] = useState(false);
+  const voiceBusy = assistantBusy || cloudPhase === 'transcribing';
   const [editingVoiceText, setEditingVoiceText] = useState(false);
   const [voiceModeNotice, setVoiceModeNotice] = useState('');
   const [voiceChoiceActive, setVoiceChoiceActive] = useState(false);
@@ -311,16 +329,50 @@ export default function BusApp() {
   const [assistantReply, setAssistantReply] = useState(
     '바꾸고 싶은 내용을 말해 주세요.',
   );
-  const [availableVoices, setAvailableVoices] = useState<
-    SpeechSynthesisVoice[]
-  >([]);
-  const koreanVoiceOptions = useMemo(
-    () =>
-      availableVoices
-        .filter((voice) => voice.lang.toLowerCase().startsWith('ko'))
-        .sort((a, b) => getVoiceQualityScore(b) - getVoiceQualityScore(a)),
-    [availableVoices],
-  );
+
+  const journeySnapshotRef = useRef<DepartureSnapshot>({
+    origin,
+    destination,
+    trip,
+    tripBusy,
+    busesBusy,
+    tripError,
+    buses,
+    settings,
+    tripMode,
+    dataMode,
+    lastUpdatedAt,
+    alertPlan,
+  });
+  useLayoutEffect(() => {
+    journeySnapshotRef.current = {
+      origin,
+      destination,
+      trip,
+      tripBusy,
+      busesBusy,
+      tripError,
+      buses,
+      settings,
+      tripMode,
+      dataMode,
+      lastUpdatedAt,
+      alertPlan,
+    };
+  }, [
+    origin,
+    destination,
+    trip,
+    tripBusy,
+    busesBusy,
+    tripError,
+    buses,
+    settings,
+    tripMode,
+    dataMode,
+    lastUpdatedAt,
+    alertPlan,
+  ]);
 
   const travelMinutes = travelMinutesForRoute(
     settings,
@@ -366,47 +418,125 @@ export default function BusApp() {
 
   const recommendationText =
     recommended && trip && destination
-      ? `${displayMode === 'demo' ? '체험용 안내입니다. ' : ''}${Math.max(0, Math.ceil(departureOffset ?? 0))}분 뒤 출발하세요. ${trip.boardingStop.name}에서 ${trip.direction} ${recommended.route}번 저상버스를 타세요.`
+      ? `${displayMode === 'demo' ? '체험용 안내입니다. ' : ''}${Math.max(0, Math.ceil(departureOffset ?? 0))}분 뒤 출발하세요. ${boardingGuidance(trip, true)}`
       : '현재 준비시간과 이동시간으로 여유 있게 탈 수 있는 저상버스를 찾지 못했어요.';
 
+  useEffect(() => {
+    const player = createSpeechPlayer({
+      onState: (state) => {
+        setSpeechState(state);
+        if (state.phase === 'loading') setSpeechError(null);
+      },
+      onError: (reason) => {
+        const message =
+          reason === 'blocked'
+            ? '브라우저가 자동 재생을 막았어요. 듣기 버튼을 다시 눌러 주세요.'
+            : reason === 'not_configured'
+              ? 'Gemini 음성이 연결되지 않았어요. 화면의 안내를 확인해 주세요.'
+              : reason === 'urgent'
+                ? '알림 음성이 준비되지 않았어요. 화면에서 출발 시간을 확인하고 안내 듣기를 눌러 주세요.'
+                : 'Gemini 음성을 재생하지 못했어요. 잠시 후 듣기 버튼을 다시 눌러 주세요.';
+        setSpeechError(message);
+      },
+    });
+    speechPlayerRef.current = player;
+    return () => {
+      player.dispose();
+      if (speechPlayerRef.current === player) speechPlayerRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    speechPlayerRef.current?.stop();
+  }, [settings.voiceRate, settings.voiceAlerts, cloudTtsEnabled]);
+
   const announce = useCallback(
-    (message: string, automatic = false) => {
-      if ((automatic && !settings.voiceAlerts) || typeof window === 'undefined')
+    (message: string, automatic = false, urgent = false) => {
+      if ((automatic && !settings.voiceAlerts) || voicePressActiveRef.current)
         return;
-      if (!('speechSynthesis' in window)) {
-        setStatusMessage('이 브라우저에서는 음성 출력을 지원하지 않아요.');
-        return;
-      }
-      window.speechSynthesis.cancel();
-      const koreanVoices = availableVoices
-        .filter((voice) => voice.lang.toLowerCase().startsWith('ko'))
-        .sort((a, b) => getVoiceQualityScore(b) - getVoiceQualityScore(a));
-      const selectedVoice =
-        koreanVoices.find((voice) => voice.voiceURI === settings.voiceURI) ??
-        koreanVoices[0];
-      const utterance = new SpeechSynthesisUtterance(message);
-      utterance.lang = 'ko-KR';
-      utterance.voice = selectedVoice ?? null;
-      utterance.rate = settings.voiceRate;
-      utterance.pitch = 1;
-      utterance.volume = 1;
-      utterance.onerror = (event) => {
-        if (event.error !== 'canceled' && event.error !== 'interrupted')
-          setNotice('음성을 재생하지 못했어요. 다시 듣기를 눌러 주세요.');
-      };
-      window.speechSynthesis.speak(utterance);
+      void speechPlayerRef.current?.speak(message, {
+        cloud: cloudTtsEnabled,
+        rate: settings.voiceRate,
+        urgent,
+      });
     },
-    [
-      availableVoices,
-      settings.voiceAlerts,
-      settings.voiceRate,
-      settings.voiceURI,
-    ],
+    [cloudTtsEnabled, settings.voiceAlerts, settings.voiceRate],
   );
+
+  useEffect(() => {
+    if (
+      !cloudTtsEnabled ||
+      !settings.voiceAlerts ||
+      !alertPlan ||
+      !trip ||
+      alertPlan.settingsKey !== timingKey(effectiveSettings)
+    )
+      return;
+    const player = speechPlayerRef.current;
+    if (!player) return;
+    // Only warm the two phrases after the user enables alerts. No page-load
+    // synthesis, no continuously changing ETA text, no persisted voice cache.
+    const messages = [
+      alertSpeechText(
+        '준비를 시작하세요',
+        settings.preparationMinutes + '분 뒤 출발할 시간이에요.',
+      ),
+      alertSpeechText('지금 출발하세요', boardingGuidance(trip, true)),
+    ];
+    void player.prefetch(messages);
+    // Refresh once near each deadline if the original five-minute cache expired.
+    const timers = [alertPlan.prepareAt, alertPlan.departAt].map(
+      (time, index) =>
+        window.setTimeout(
+          () => {
+            void player.prefetch([messages[index]]);
+          },
+          Math.max(0, time - Date.now() - 60_000),
+        ),
+    );
+    return () => timers.forEach((timer) => window.clearTimeout(timer));
+  }, [
+    cloudTtsEnabled,
+    settings.voiceAlerts,
+    settings.preparationMinutes,
+    alertPlan,
+    trip,
+    effectiveSettings,
+  ]);
+
+  useEffect(() => {
+    const pending = pendingGuidanceRef.current;
+    if (
+      !pending ||
+      origin.id !== pending.originId ||
+      destination?.id !== pending.destinationId
+    )
+      return;
+    if (
+      tripBusy ||
+      busesBusy ||
+      (!tripError && (!trip || lastUpdatedAt === null))
+    )
+      return;
+    pendingGuidanceRef.current = null;
+    const text = departureGuidance(journeySnapshotRef.current);
+    setAssistantReply(text);
+    setStatusMessage(text);
+    announce(text);
+  }, [
+    origin,
+    destination,
+    trip,
+    tripBusy,
+    busesBusy,
+    lastUpdatedAt,
+    tripError,
+    announce,
+  ]);
 
   const notify = useCallback(
     (title: string, body: string) => {
-      announce(title + '. ' + body, true);
+      announce(alertSpeechText(title, body), true, true);
       if (settings.vibrationAlerts && 'vibrate' in navigator) {
         navigator.vibrate([180, 90, 180]);
       }
@@ -491,13 +621,6 @@ export default function BusApp() {
     if ('serviceWorker' in navigator) {
       void navigator.serviceWorker.register('/sw.js').catch(() => undefined);
     }
-    const loadVoices = () => {
-      if ('speechSynthesis' in window) {
-        setAvailableVoices(window.speechSynthesis.getVoices());
-      }
-    };
-    loadVoices();
-    window.speechSynthesis?.addEventListener('voiceschanged', loadVoices);
     const handleInstall = (event: Event) => {
       event.preventDefault();
       setInstallPrompt(event as InstallPromptEvent);
@@ -505,10 +628,11 @@ export default function BusApp() {
     window.addEventListener('beforeinstallprompt', handleInstall);
     return () => {
       assistantRequestRef.current?.abort();
+      transcriptionRequestRef.current?.abort();
+      recordingRef.current?.cancel();
       locationRequestRef.current?.abort();
       window.cancelAnimationFrame(initializationFrame);
       window.clearInterval(clockTimer);
-      window.speechSynthesis?.removeEventListener('voiceschanged', loadVoices);
       window.removeEventListener('beforeinstallprompt', handleInstall);
       if (assistantCloseTimerRef.current !== null) {
         window.clearTimeout(assistantCloseTimerRef.current);
@@ -577,6 +701,7 @@ export default function BusApp() {
 
     async function loadTrip() {
       setTripBusy(true);
+      setLastUpdatedAt(null);
       setTripError(null);
       setTracking(false);
       setTrip(null);
@@ -592,6 +717,7 @@ export default function BusApp() {
           notice?: string;
           alternatives?: TripPlan[];
         };
+        if (controller.signal.aborted) return;
         if (!payload.trip) {
           setTripMode('unavailable');
           setTripError(payload.notice ?? '직행 저상버스 경로를 찾지 못했어요.');
@@ -609,6 +735,7 @@ export default function BusApp() {
           direction: payload.trip.direction,
           route: payload.trip.route,
           cityCode: payload.trip.boardingStop.cityCode,
+          routeId: payload.trip.routeId,
         });
         setStatusMessage(
           payload.mode === 'live'
@@ -646,6 +773,8 @@ export default function BusApp() {
           encodeURIComponent(selectedStop.id) +
           '&cityCode=' +
           encodeURIComponent(selectedStop.cityCode ?? '') +
+          '&routeId=' +
+          encodeURIComponent(selectedStop.routeId ?? '') +
           '&demo=' +
           (tripMode === 'demo' ? '1' : '0');
         const response = await fetch(requestUrl, { signal: controller.signal });
@@ -674,6 +803,7 @@ export default function BusApp() {
         if ((error as Error).name !== 'AbortError') {
           setBuses([]);
           setDataMode('unavailable');
+          setLastUpdatedAt(Date.now());
           setStatusMessage(
             '도착 정보를 불러오지 못했어요. 30초 뒤 다시 확인할게요.',
           );
@@ -741,15 +871,7 @@ export default function BusApp() {
         sentAlerts.current.depart = true;
         sentAlerts.current.prepare = true;
         setAlertPhase('depart');
-        notify(
-          '지금 출발하세요',
-          trip.boardingStop.name +
-            '에서 ' +
-            trip.direction +
-            ' ' +
-            alertPlan.bus.route +
-            '번 버스를 타세요.',
-        );
+        notify('지금 출발하세요', boardingGuidance(trip, true));
       } else if (event === 'prepare') {
         sentAlerts.current.prepare = true;
         setAlertPhase('prepare');
@@ -913,6 +1035,7 @@ export default function BusApp() {
   }, [buses, settings, startAlerts]);
 
   const openPlacePicker = (kind: 'origin' | 'destination') => {
+    pendingGuidanceRef.current = null;
     locationRequestRef.current?.abort();
     locationRequestRef.current = null;
     setPlaceBusy(false);
@@ -1028,9 +1151,15 @@ export default function BusApp() {
       });
   };
 
+  const replyToVoice = (text: string) => {
+    setAssistantReply(text);
+    setStatusMessage(text);
+    announce(text);
+  };
+
   const runAssistant = async (message: string, chosenPlace?: Place) => {
     const cleanMessage = message.trim();
-    if (!cleanMessage || assistantBusy) return;
+    if (!cleanMessage || assistantRequestRef.current) return;
     if (cleanMessage.length > 300) {
       setAssistantReply(
         '말한 내용이 길어요. 글로 입력에서 장소 이름 위주로 줄여 주세요.',
@@ -1038,32 +1167,29 @@ export default function BusApp() {
       setEditingVoiceText(true);
       return;
     }
-    assistantRequestRef.current?.abort();
     const request = new AbortController();
     assistantRequestRef.current = request;
+    pendingGuidanceRef.current = null;
     setEditingVoiceText(false);
     if (assistantCloseTimerRef.current !== null) {
       window.clearTimeout(assistantCloseTimerRef.current);
       assistantCloseTimerRef.current = null;
     }
     setAssistantBusy(true);
-    setAssistantReply('요청을 이해하고 필요한 정보를 확인하고 있어요…');
-    setStatusMessage('AI 도우미가 요청을 분석하고 있어요.');
+    setAssistantReply('말씀하신 내용을 확인하고 있어요.');
     try {
-      let spokenOrigin: Place | null = null;
-      let spokenDestination: Place | null = null;
       const pending = voiceDraftRef.current;
       const candidate =
         chosenPlace ??
         (pending?.pendingSlot
           ? candidateFromSpeech(cleanMessage, voiceCandidatesRef.current)
           : null);
-      let queries = parseRouteFollowUp(
+      let command = localVoiceCommand(
         cleanMessage,
         pending?.pendingSlot ?? null,
       );
       if (!candidate) {
-        const intentResponse = await fetch('/api/voice-intent', {
+        const response = await fetch('/api/voice-intent', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1072,213 +1198,150 @@ export default function BusApp() {
           }),
           signal: AbortSignal.any([
             request.signal,
-            AbortSignal.timeout(10_000),
+            AbortSignal.timeout(12_000),
           ]),
         });
-        if (!intentResponse.ok) {
-          setAssistantReply(
-            intentResponse.status === 429
+        if (!response.ok) {
+          replyToVoice(
+            response.status === 429
               ? '요청이 많아요. 잠시 후 다시 말해 주세요.'
               : '말한 내용을 확인하지 못했어요. 다시 시도해 주세요.',
           );
           return;
         }
-        const intent = (await intentResponse.json()) as VoiceIntent & {
-          mode: 'local' | 'model';
-          reason?: string;
-        };
+        const { mode, reason, ...payload } = await response.json();
+        command = validateVoiceCommand(payload);
         if (request.signal.aborted) return;
         setVoiceModeNotice(
-          intent.mode === 'model'
+          mode === 'model'
             ? 'AI로 문장을 해석했어요.'
-            : intent.reason === 'model_unavailable'
+            : reason === 'model_unavailable'
               ? 'AI 연결이 어려워 기본 문장 해석을 사용했어요.'
               : '현재 기본 문장 해석을 사용하고 있어요.',
         );
-        queries = intent;
-        if (intent.clarification) {
-          const literal = parseRouteFollowUp(
-            cleanMessage,
-            pending?.pendingSlot ?? null,
-          );
-          const draft = mergeVoiceDraft(
-            pending,
-            {
-              originQuery: queries.originQuery || literal.originQuery,
-              destinationQuery:
-                queries.destinationQuery || literal.destinationQuery,
-            },
-            origin.id === 'unset' ? null : origin,
-            destination,
-          );
-          draft.pendingSlot = /^(우리\s*)?(집|회사|거기|저기|병원)$/.test(
-            draft.originQuery,
-          )
-            ? 'origin'
-            : /^(우리\s*)?(집|회사|거기|저기|병원)$/.test(
-                  draft.destinationQuery,
-                )
-              ? 'destination'
-              : (pending?.pendingSlot ?? null);
-          voiceDraftRef.current = draft;
-          const question = draft.pendingSlot
-            ? intent.clarification
-            : '출발지와 도착지를 정확히 나누지 못했어요. “서울역에서 강남역까지”처럼 다시 말해 주세요.';
-          setAssistantReply(question);
-          announce(question);
-          return;
-        }
       }
-      if (candidate || queries.originQuery || queries.destinationQuery) {
-        let draft = mergeVoiceDraft(
-          pending,
-          candidate ? { originQuery: '', destinationQuery: '' } : queries,
-          origin.id === 'unset' ? null : origin,
-          destination,
-        );
-        if (candidate && draft.pendingSlot)
-          draft = { ...draft, [draft.pendingSlot]: candidate };
-        voiceDraftRef.current = draft;
-        const resolution = await resolveVoiceDraft(draft, {
-          search: (query, center) =>
-            requestPlaceMatches(query, center, request.signal),
-          locate: () => requestCurrentLocation(request.signal),
-        });
-        if (request.signal.aborted) return;
-        voiceDraftRef.current = resolution.draft;
-        if (resolution.kind !== 'complete') {
-          setAssistantReply(resolution.message);
-          setStatusMessage(resolution.message);
-          announce(resolution.message);
-          if (resolution.kind === 'choose') {
-            setVoiceChoiceActive(true);
-            voiceCandidatesRef.current = resolution.places;
-            setPlaceResults(resolution.places);
-            setPlaceQuery(
-              resolution.slot === 'origin'
-                ? resolution.draft.originQuery
-                : resolution.draft.destinationQuery,
-            );
-            setPlaceMessage(resolution.message);
-            setAssistantOpen(false);
-            setPlacePicker(resolution.slot);
-          } else {
-            setVoiceChoiceActive(false);
-            voiceCandidatesRef.current = [];
-          }
-          return;
-        }
-        spokenOrigin = resolution.origin;
-        spokenDestination = resolution.destination;
-      }
-
-      const availablePlaces = [
-        ...(spokenOrigin ? [spokenOrigin] : []),
-        ...(spokenDestination ? [spokenDestination] : []),
-        origin,
-        ...(destination ? [destination] : []),
-        ...placeResults,
-        ...demoPlaces,
-      ].filter(
-        (place, index, places) =>
-          places.findIndex((candidate) => candidate.id === place.id) === index,
-      );
-      const response = await fetch('/api/assistant', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          message: cleanMessage,
-          currentStop: selectedStop,
-          availableStops: [selectedStop],
-          currentOrigin: origin,
-          currentDestination: destination,
-          availablePlaces,
-          spokenOriginPlaceId: spokenOrigin?.id,
-          spokenDestinationPlaceId: spokenDestination?.id,
-          settings,
-        }),
-        signal: AbortSignal.any([request.signal, AbortSignal.timeout(10_000)]),
-      });
-      const payload = (await response.json()) as AssistantResponse & {
-        error?: string;
-      };
-      if (!response.ok)
-        throw new Error(payload.error ?? 'assistant request failed');
-      if (request.signal.aborted) return;
-
-      const nextOrigin = availablePlaces.find(
-        (place) => place.id === payload.changes.originPlaceId,
-      );
-      const nextDestination = availablePlaces.find(
-        (place) => place.id === payload.changes.destinationPlaceId,
-      );
-      const placeChanged = Boolean(nextOrigin || nextDestination);
-      if (placeChanged) {
-        setTrip(null);
-        setBuses([]);
-        setTracking(false);
-      }
-      if (nextOrigin) setOrigin(nextOrigin);
-      if (nextDestination) setDestination(nextDestination);
-      if (spokenOrigin && spokenDestination && !payload.needsClarification) {
-        setVoiceChoiceActive(false);
+      if (!candidate && command.action === 'cancel') {
         voiceDraftRef.current = null;
         voiceCandidatesRef.current = [];
+        setVoiceChoiceActive(false);
+        replyToVoice(
+          '이번 음성 요청을 취소했어요. 기존 경로와 설정은 그대로예요.',
+        );
+        return;
       }
-      if (nextDestination && !nextOrigin && origin.id === 'unset') {
-        setAssistantOpen(false);
-        setPlacePicker('origin');
-        setPlaceMessage('출발할 장소를 골라 주세요.');
-      }
-
-      if (payload.changes.stopId) {
-        const nextStop =
-          selectedStop.id === payload.changes.stopId ? selectedStop : null;
-        if (nextStop) {
-          setSelectedStop(nextStop);
+      const latest = journeySnapshotRef.current;
+      if (!candidate && command.action !== 'route') {
+        if (command.clarification || command.action === 'unknown') {
+          replyToVoice(
+            command.clarification ||
+              '출발지와 도착지, 준비 시간, 또는 언제 출발할지 말해 주세요.',
+          );
+          return;
+        }
+        const nextSettings = applyTimingPatch(
+          latest.settings,
+          command.settingsPatch,
+        );
+        if (Object.keys(command.settingsPatch).length) {
+          setSettings(nextSettings);
           setTracking(false);
+          // An explicit settings-only request supersedes a pending time change.
+          if (voiceDraftRef.current)
+            voiceDraftRef.current.settingsPatch = {
+              ...voiceDraftRef.current.settingsPatch,
+              ...command.settingsPatch,
+            };
         }
+        replyToVoice(
+          (timingPatchText(command.settingsPatch)
+            ? timingPatchText(command.settingsPatch) + '으로 바꿨어요. '
+            : '') + departureGuidance({ ...latest, settings: nextSettings }),
+        );
+        return;
       }
-      setSettings((current) => ({
-        ...current,
-        ...(payload.changes.preparationMinutes !== undefined
-          ? { preparationMinutes: payload.changes.preparationMinutes }
-          : {}),
-        ...(payload.changes.travelMinutes !== undefined
-          ? {
-              travelMinutes: payload.changes.travelMinutes,
-              automaticTravelTime: false,
-            }
-          : {}),
-        ...(payload.changes.safetyMinutes !== undefined
-          ? { safetyMinutes: payload.changes.safetyMinutes }
-          : {}),
-      }));
-      setAssistantReply(payload.responseText);
-      setStatusMessage(
-        payload.needsClarification
-          ? '한 가지를 더 확인해 주세요.'
-          : '말한 내용을 반영했어요.',
+      let draft = mergeVoiceDraft(
+        pending,
+        candidate ? { originQuery: '', destinationQuery: '' } : command,
+        latest.origin.id === 'unset' ? null : latest.origin,
+        latest.destination,
+        candidate ? {} : command.settingsPatch,
       );
-      announce(payload.responseText);
-      if (
-        !payload.needsClarification &&
-        Object.keys(payload.changes).length > 0
-      ) {
-        if (assistantCloseTimerRef.current !== null) {
-          window.clearTimeout(assistantCloseTimerRef.current);
-        }
-        assistantCloseTimerRef.current = window.setTimeout(() => {
-          setAssistantOpen(false);
-          assistantCloseTimerRef.current = null;
-        }, 4500);
+      if (candidate && draft.pendingSlot)
+        draft = { ...draft, [draft.pendingSlot]: candidate };
+      if (!candidate && command.clarification) {
+        draft.pendingSlot =
+          command.clarificationSlot ?? pending?.pendingSlot ?? null;
+        voiceDraftRef.current = draft;
+        voiceCandidatesRef.current = [];
+        replyToVoice(command.clarification);
+        return;
       }
-    } catch {
+      voiceDraftRef.current = draft;
+      const resolution = await resolveVoiceDraft(draft, {
+        search: (query, center) =>
+          requestPlaceMatches(query, center, request.signal),
+        locate: () => requestCurrentLocation(request.signal),
+      });
       if (request.signal.aborted) return;
-      setAssistantReply(
-        '잠시 연결이 불안정해요. 현재 화면의 추천은 계속 이용할 수 있어요.',
+      voiceDraftRef.current = resolution.draft;
+      if (resolution.kind !== 'complete') {
+        replyToVoice(resolution.message);
+        if (resolution.kind === 'choose') {
+          setVoiceChoiceActive(true);
+          voiceCandidatesRef.current = resolution.places;
+          setPlaceResults(resolution.places);
+          setPlaceQuery(
+            resolution.slot === 'origin'
+              ? resolution.draft.originQuery
+              : resolution.draft.destinationQuery,
+          );
+          setPlaceMessage(resolution.message);
+          setAssistantOpen(false);
+          setPlacePicker(resolution.slot);
+        } else {
+          setVoiceChoiceActive(false);
+          voiceCandidatesRef.current = [];
+        }
+        return;
+      }
+      const current = journeySnapshotRef.current;
+      const patch = resolution.draft.settingsPatch ?? {};
+      const nextSettings = applyTimingPatch(current.settings, patch);
+      setSettings(nextSettings);
+      setVoiceChoiceActive(false);
+      voiceDraftRef.current = null;
+      voiceCandidatesRef.current = [];
+      const changed =
+        !isSamePlace(current.origin, resolution.origin) ||
+        !current.destination ||
+        !isSamePlace(current.destination, resolution.destination);
+      if (!changed && current.trip) {
+        if (Object.keys(patch).length) setTracking(false);
+        replyToVoice(departureGuidance({ ...current, settings: nextSettings }));
+        return;
+      }
+      setTracking(false);
+      setTrip(null);
+      setTripError(null);
+      setBuses([]);
+      setLastUpdatedAt(null);
+      setOrigin({ ...resolution.origin });
+      setDestination({ ...resolution.destination });
+      pendingGuidanceRef.current = {
+        originId: resolution.origin.id,
+        destinationId: resolution.destination.id,
+      };
+      replyToVoice(
+        resolution.origin.name +
+          '에서 ' +
+          resolution.destination.name +
+          '까지, 버스 도착 시간을 확인할게요.',
       );
-      setStatusMessage('AI 도우미 연결이 어려워 기존 추천을 유지했어요.');
+    } catch {
+      if (!request.signal.aborted)
+        replyToVoice(
+          '연결이 불안정해요. 다시 시도하거나 출발지와 도착지를 직접 선택해 주세요.',
+        );
     } finally {
       if (assistantRequestRef.current === request) {
         assistantRequestRef.current = null;
@@ -1303,6 +1366,11 @@ export default function BusApp() {
   }, []);
 
   const stopListening = useCallback(() => {
+    if (recordingRef.current) {
+      voicePressActiveRef.current = false;
+      recordingRef.current.stop();
+      return;
+    }
     if (
       !voicePressActiveRef.current &&
       finishVoiceSessionRef.current === null
@@ -1341,6 +1409,12 @@ export default function BusApp() {
   const cancelListening = useCallback(() => {
     const recognition = recognitionRef.current;
     voiceSessionIdRef.current += 1;
+    recordingRef.current?.cancel();
+    recordingRef.current = null;
+    transcriptionRequestRef.current?.abort();
+    transcriptionRequestRef.current = null;
+    voiceSubmittingRef.current = false;
+    setCloudPhase('idle');
     voicePressActiveRef.current = false;
     voicePointerIdRef.current = null;
     voiceKeyboardActiveRef.current = false;
@@ -1358,7 +1432,7 @@ export default function BusApp() {
     setListening(false);
   }, [clearVoiceTimers]);
 
-  const startListening = () => {
+  const startBrowserListening = () => {
     if (
       voicePressActiveRef.current ||
       voiceSubmittingRef.current ||
@@ -1388,7 +1462,7 @@ export default function BusApp() {
     const sessionId = voiceSessionIdRef.current + 1;
     voiceSessionIdRef.current = sessionId;
     voicePressActiveRef.current = true;
-    window.speechSynthesis?.cancel();
+    speechPlayerRef.current?.stop();
     setListening(true);
     setAssistantReply('듣고 있어요… 출발지와 도착지를 이어서 말해 주세요.');
     setStatusMessage('버튼을 누르고 있는 동안 음성을 듣고 있어요.');
@@ -1555,6 +1629,146 @@ export default function BusApp() {
     }, 15_000);
 
     launchRecognition();
+  };
+
+  const runAssistantRef = useRef(runAssistant);
+  useLayoutEffect(() => {
+    runAssistantRef.current = runAssistant;
+  });
+
+  const startListening = () => {
+    if (
+      voicePressActiveRef.current ||
+      voiceSubmittingRef.current ||
+      assistantRequestRef.current
+    )
+      return;
+    // Stop both generated and device speech before even asking for a mic.
+    // Unsupported/denied recognition must not leave an old instruction playing.
+    speechPlayerRef.current?.stop();
+    if (
+      !cloudSpeechEnabled ||
+      browserVoiceFallback ||
+      !supportsCloudRecording()
+    ) {
+      startBrowserListening();
+      return;
+    }
+    if (assistantCloseTimerRef.current !== null) {
+      window.clearTimeout(assistantCloseTimerRef.current);
+      assistantCloseTimerRef.current = null;
+    }
+    const sessionId = ++voiceSessionIdRef.current;
+    const isCurrent = () => voiceSessionIdRef.current === sessionId;
+    voicePressActiveRef.current = true;
+    setAssistantOpen(true);
+    setAssistantInput('');
+    setEditingVoiceText(false);
+    setCloudVoiceFailed(false);
+    setCloudPhase('starting');
+    setAssistantReply(
+      '마이크를 준비하고 있어요. “듣고 있어요”가 나오면 말해 주세요.',
+    );
+    speechPlayerRef.current?.stop();
+    const fail = (error: unknown) => {
+      if (!isCurrent()) return;
+      voicePressActiveRef.current = false;
+      voiceSubmittingRef.current = false;
+      setListening(false);
+      setCloudPhase('idle');
+      setCloudVoiceFailed(true);
+      const name = error instanceof Error ? error.name : '';
+      const message =
+        name === 'NotAllowedError'
+          ? '마이크 권한이 필요해요. 브라우저에서 마이크를 허용해 주세요.'
+          : name === 'NotFoundError'
+            ? '마이크를 찾지 못했어요. 기기의 마이크 설정을 확인해 주세요.'
+            : error instanceof Error &&
+                /[가-힣]/.test(error.message) &&
+                name !== 'TimeoutError'
+              ? error.message
+              : '음성인식 연결이 지연되고 있어요. 다시 말하거나 글로 입력해 주세요.';
+      setAssistantReply(message);
+      setStatusMessage(message);
+    };
+    const recording = createAudioRecording({
+      onReady: () => {
+        if (!isCurrent()) return;
+        setListening(true);
+        setCloudPhase('recording');
+        setStatusMessage(
+          '듣고 있어요. 손을 떼면 확인할게요. 최대 15초까지 들을게요.',
+        );
+      },
+      onStopped: (cancelled) => {
+        if (!isCurrent()) return;
+        recordingRef.current = null;
+        voicePressActiveRef.current = false;
+        voiceKeyboardActiveRef.current = false;
+        setListening(false);
+        setCloudPhase(cancelled ? 'idle' : 'transcribing');
+        if (cancelled)
+          setAssistantReply(
+            '녹음을 취소했어요. 마이크가 준비되면 다시 눌러 말해 주세요.',
+          );
+      },
+      onError: fail,
+      onAudio: (blob) => {
+        if (!isCurrent()) return;
+        voiceSubmittingRef.current = true;
+        const request = new AbortController();
+        transcriptionRequestRef.current = request;
+        void (async () => {
+          try {
+            const audio = await recordingBlobToWav(blob);
+            if (!isCurrent() || request.signal.aborted) return;
+            const response = await fetch('/api/transcribe', {
+              method: 'POST',
+              headers: { 'Content-Type': 'audio/wav' },
+              body: audio,
+              signal: AbortSignal.any([
+                request.signal,
+                AbortSignal.timeout(25_000),
+              ]),
+            });
+            const payload = await response.json();
+            if (!isCurrent() || request.signal.aborted) return;
+            if (!response.ok)
+              throw new Error(
+                payload.error || '음성을 확인하지 못했어요. 다시 말해 주세요.',
+              );
+            if (typeof payload.text !== 'string' || !payload.text.trim())
+              throw new Error(
+                payload.reason === 'too_long'
+                  ? '말한 내용이 길어요. 출발지와 도착지 위주로 짧게 말해 주세요.'
+                  : '말소리가 들리지 않았어요. 마이크 가까이에서 다시 말해 주세요.',
+              );
+            setAssistantInput(payload.text);
+            setCloudPhase('idle');
+            await runAssistantRef.current(payload.text);
+          } catch (error) {
+            if (!isCurrent() || request.signal.aborted) return;
+            // No second upload or automatic recording on error.
+            fail(
+              error instanceof TypeError
+                ? new Error(
+                    '음성인식에 연결하지 못했어요. 다시 말하거나 글로 입력해 주세요.',
+                  )
+                : error,
+            );
+          } finally {
+            if (transcriptionRequestRef.current === request)
+              transcriptionRequestRef.current = null;
+            if (isCurrent()) {
+              voiceSubmittingRef.current = false;
+              setCloudPhase('idle');
+            }
+          }
+        })();
+      },
+    });
+    recordingRef.current = recording;
+    void recording.start();
   };
 
   const beginVoicePointer = (event: ReactPointerEvent<HTMLButtonElement>) => {
@@ -1727,7 +1941,16 @@ export default function BusApp() {
   };
 
   return (
-    <main className="min-h-dvh bg-[#F2F4F6] text-[#191F28]">
+    <main
+      className="min-h-dvh bg-[#F2F4F6] text-[#191F28]"
+      onPointerDownCapture={() => {
+        if (cloudTtsEnabled) speechPlayerRef.current?.unlock();
+      }}
+      onKeyDownCapture={(event) => {
+        if ((event.key === 'Enter' || event.key === ' ') && cloudTtsEnabled)
+          speechPlayerRef.current?.unlock();
+      }}
+    >
       <div className="mx-auto min-h-dvh w-full max-w-[480px] bg-white shadow-[0_0_48px_rgba(0,0,0,0.06)]">
         <header className="border-b border-[#F2F4F6] bg-white px-5 pb-5 pt-[max(1.25rem,env(safe-area-inset-top))] text-[#191F28]">
           <div className="flex items-center justify-between">
@@ -1770,6 +1993,10 @@ export default function BusApp() {
               </button>
             </div>
           </div>
+
+          <p className="mt-3 text-sm leading-6 text-[#4E5968]">
+            저상버스 타러 나갈 시간을 알려드려요
+          </p>
 
           <div className="mt-5 flex overflow-hidden rounded-2xl bg-[#F2F4F6]">
             <div className="min-w-0 flex-1 px-4">
@@ -1848,7 +2075,7 @@ export default function BusApp() {
               onKeyUp={handleVoiceKeyUp}
               onClick={handleVoiceClick}
               onContextMenu={(event) => event.preventDefault()}
-              disabled={assistantBusy}
+              disabled={voiceBusy}
               className={
                 'flex w-[4.75rem] touch-none select-none shrink-0 flex-col items-center justify-center gap-2 border-l border-[#E5E8EB] text-xs font-semibold leading-4 focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[#2165D6] disabled:cursor-wait ' +
                 (listening
@@ -2019,35 +2246,14 @@ export default function BusApp() {
                     </span>
                   </div>
 
-                  <div className="py-4">
-                    <div className="grid grid-cols-[1.5rem_1fr] gap-x-3 gap-y-4">
-                      <span
-                        aria-hidden="true"
-                        className="mt-1 size-3 rounded-full border-[3px] border-[#2165D6] bg-white"
-                      />
-                      <div>
-                        <p className="text-sm font-medium text-[#6B7684]">
-                          타는 곳
-                        </p>
-                        <p className="mt-0.5 text-lg font-semibold">
-                          {trip.boardingStop.name}
-                        </p>
-                      </div>
-                      <MapPin
-                        aria-hidden="true"
-                        className="-ml-1 size-5 text-[#E5484D]"
-                      />
-                      <div>
-                        <p className="text-sm font-medium text-[#6B7684]">
-                          내리는 곳
-                        </p>
-                        <p className="mt-0.5 text-lg font-semibold">
-                          {trip.alightingStop.name}
-                        </p>
-                      </div>
-                    </div>
-
-                    <div className="mt-4 flex items-center justify-between rounded-xl bg-white px-4 py-3">
+                  <div className="pb-4">
+                    <BoardingGuide
+                      trip={trip}
+                      speechState={speechState}
+                      onSpeak={announce}
+                      onStop={() => speechPlayerRef.current?.stop()}
+                    />
+                    <div className="flex items-center justify-between rounded-xl bg-white px-4 py-3">
                       <div className="flex items-center gap-2 text-[#4E5968]">
                         <Clock3 aria-hidden="true" className="size-5" />
                         <span className="font-medium">준비 시작</span>
@@ -2096,11 +2302,24 @@ export default function BusApp() {
                   <Button
                     variant="outline"
                     className="h-14 w-full rounded-2xl border-0 bg-[#F2F4F6] text-base font-semibold text-[#333D4B] hover:bg-[#E5E8EB]"
-                    onClick={() => announce(recommendationText)}
+                    onClick={() =>
+                      speechBusy
+                        ? speechPlayerRef.current?.stop()
+                        : announce(recommendationText)
+                    }
                   >
                     <Volume2 aria-hidden="true" className="size-5" />
-                    안내 듣기
+                    {speechState.phase === 'loading'
+                      ? '음성 준비 취소'
+                      : speechBusy
+                        ? '음성 멈추기'
+                        : '안내 듣기'}
                   </Button>
+                  {cloudTtsEnabled && (
+                    <p className="mt-2 text-center text-xs text-[#647184]">
+                      Gemini 음성으로 안내해요
+                    </p>
+                  )}
                 </div>
 
                 <details className="mt-5 border-t border-[#E5E8EB]">
@@ -2153,14 +2372,13 @@ export default function BusApp() {
                     ? '저상버스 도착 정보가 확인되지 않아 아무 버스나 추천하지 않을게요.'
                     : '다음 도착 정보를 다시 확인하거나 이동 시간을 바꿔보세요.'}
                 </p>
-                <div className="mt-6 rounded-2xl bg-[#F2F4F6] p-4">
-                  <p className="text-lg font-semibold">
-                    {trip.route}번 · {trip.direction}
-                  </p>
-                  <p className="mt-1 text-sm font-medium leading-6 text-[#6B7684]">
-                    {trip.boardingStop.name}에서 타고 {trip.alightingStop.name}
-                    에서 내려요
-                  </p>
+                <div className="mt-6 rounded-2xl bg-[#F2F4F6] px-4">
+                  <BoardingGuide
+                    trip={trip}
+                    speechState={speechState}
+                    onSpeak={announce}
+                    onStop={() => speechPlayerRef.current?.stop()}
+                  />
                 </div>
                 <Button
                   className="mt-5 h-14 w-full rounded-2xl bg-[#2165D6] text-base font-semibold text-white hover:bg-[#1B64DA]"
@@ -2178,6 +2396,22 @@ export default function BusApp() {
                   {dataMode === 'unavailable' || feedStale
                     ? '다시 확인하기'
                     : '내 시간 바꾸기'}
+                </Button>
+                <Button
+                  variant="outline"
+                  className="mt-3 h-14 w-full rounded-2xl border-0 bg-[#F2F4F6] text-base font-semibold text-[#333D4B] hover:bg-[#E5E8EB]"
+                  onClick={() =>
+                    speechBusy
+                      ? speechPlayerRef.current?.stop()
+                      : announce(departureGuidance(journeySnapshotRef.current))
+                  }
+                >
+                  <Volume2 aria-hidden="true" className="size-5" />
+                  {speechState.phase === 'loading'
+                    ? '음성 준비 취소'
+                    : speechBusy
+                      ? '음성 멈추기'
+                      : '안내 듣기'}
                 </Button>
               </div>
             )}
@@ -2206,6 +2440,7 @@ export default function BusApp() {
                         direction: candidate.direction,
                         route: candidate.route,
                         cityCode: candidate.boardingStop.cityCode,
+                        routeId: candidate.routeId,
                       });
                     }}
                   >
@@ -2231,6 +2466,11 @@ export default function BusApp() {
               지도에서 전체 경로 보기{' '}
               <ExternalLink aria-hidden="true" className="size-4" />
             </a>
+          )}
+          {speechError && !settingsOpen && !assistantOpen && (
+            <output className="mt-4 block rounded-xl bg-[#F2F4F6] p-4 text-sm leading-6 text-[#4E5968]">
+              {speechError}
+            </output>
           )}
           {notice && (
             <div
@@ -2261,9 +2501,15 @@ export default function BusApp() {
           setAssistantOpen(open);
           if (!open) {
             assistantRequestRef.current?.abort();
+            pendingGuidanceRef.current = null;
             voiceDraftRef.current = null;
             voiceCandidatesRef.current = [];
-            if (recognitionRef.current || voicePressActiveRef.current) {
+            if (
+              recognitionRef.current ||
+              voicePressActiveRef.current ||
+              recordingRef.current ||
+              transcriptionRequestRef.current
+            ) {
               cancelListening();
             }
             if (assistantCloseTimerRef.current !== null) {
@@ -2276,26 +2522,39 @@ export default function BusApp() {
         <DialogContent className="h-[min(36rem,100svh)] grid-rows-[minmax(0,1fr)_9rem_minmax(0,1fr)_3rem] gap-3 overflow-hidden px-6 pb-[max(1.5rem,env(safe-area-inset-bottom))] pt-8 text-center sm:max-w-sm">
           <DialogHeader className="min-h-0 items-center gap-2 pr-0">
             <DialogTitle className="w-full shrink-0 px-9 text-2xl font-bold leading-8 tracking-[-0.02em]">
-              {listening
-                ? '듣고 있어요'
-                : assistantBusy
-                  ? '경로를 찾고 있어요'
-                  : assistantInput
-                    ? '이렇게 들었어요'
-                    : '어디로 갈까요?'}
+              {cloudPhase === 'starting'
+                ? '마이크 준비 중'
+                : cloudPhase === 'transcribing'
+                  ? '말씀을 확인하고 있어요'
+                  : listening
+                    ? '듣고 있어요'
+                    : assistantBusy
+                      ? '경로를 찾고 있어요'
+                      : assistantInput
+                        ? '이렇게 들었어요'
+                        : '어디로 갈까요?'}
             </DialogTitle>
             <DialogDescription
               className="min-h-0 w-full overflow-y-auto break-words text-base leading-6"
               aria-live="polite"
               aria-atomic="true"
             >
-              {listening
-                ? tapToTalk
-                  ? '다시 누르면 적용해요. 최대 15초까지 들을게요.'
-                  : '손을 떼면 적용해요. 최대 15초까지 들을게요.'
-                : assistantBusy
-                  ? '말씀하신 장소를 확인하고 있어요.'
-                  : assistantReply}
+              {cloudPhase === 'starting'
+                ? '마이크를 허용한 뒤, 듣고 있어요가 나오면 말해 주세요.'
+                : cloudPhase === 'transcribing'
+                  ? '녹음한 음성을 글로 바꾸고 있어요.'
+                  : listening
+                    ? tapToTalk
+                      ? '다시 누르면 적용해요. 최대 15초까지 들을게요.'
+                      : '손을 떼면 적용해요. 최대 15초까지 들을게요.'
+                    : assistantBusy
+                      ? '말씀하신 장소를 확인하고 있어요.'
+                      : assistantReply}
+              {speechError && !listening && !voiceBusy && (
+                <span className="mt-2 block text-sm text-[#647184]">
+                  {speechError}
+                </span>
+              )}
             </DialogDescription>
           </DialogHeader>
 
@@ -2309,25 +2568,25 @@ export default function BusApp() {
               onKeyUp={handleVoiceKeyUp}
               onClick={handleVoiceClick}
               onContextMenu={(event) => event.preventDefault()}
-              disabled={assistantBusy}
+              disabled={voiceBusy}
               className={
                 'relative grid size-28 touch-none select-none place-items-center rounded-full transition focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-[#2165D6] disabled:cursor-wait ' +
                 (listening
                   ? 'bg-[#2165D6] text-white shadow-[0_0_0_12px_#E8F3FF]'
-                  : assistantBusy
+                  : voiceBusy
                     ? 'bg-[#E8F3FF] text-[#2165D6]'
                     : 'bg-[#F2F4F6] text-[#2165D6] hover:bg-[#E8F3FF]')
               }
               aria-label={
                 listening
                   ? '음성 인식 중. 손을 떼거나 다시 누르면 경로를 적용합니다'
-                  : assistantBusy
+                  : voiceBusy
                     ? '경로 확인 중'
                     : '누르고 있는 동안 말하기. 최대 15초'
               }
               aria-pressed={listening}
             >
-              {assistantBusy ? (
+              {voiceBusy || cloudPhase === 'starting' ? (
                 <LoaderCircle
                   aria-hidden="true"
                   className="size-11 animate-spin"
@@ -2373,7 +2632,7 @@ export default function BusApp() {
                 />
                 <button
                   type="submit"
-                  disabled={assistantBusy || !assistantInput.trim()}
+                  disabled={voiceBusy || !assistantInput.trim()}
                   className="min-h-11 w-full rounded-xl bg-[#2165D6] text-white disabled:opacity-50"
                 >
                   이 내용으로 찾기
@@ -2391,14 +2650,36 @@ export default function BusApp() {
             {!editingVoiceText && voiceModeNotice && (
               <p className="mt-2 text-xs text-[#647184]">{voiceModeNotice}</p>
             )}
+            {cloudSpeechEnabled && !browserVoiceFallback && (
+              <p className="mt-2 text-xs text-[#647184]">
+                음성인식을 위해 녹음을 Cloudflare에 전송해요.
+              </p>
+            )}
+            {cloudVoiceFailed && !voiceBusy && !listening && (
+              <button
+                type="button"
+                className="mt-2 min-h-11 text-sm font-semibold text-[#1B64DA]"
+                onClick={() => {
+                  setBrowserVoiceFallback(true);
+                  setCloudVoiceFailed(false);
+                  setAssistantReply(
+                    '기기 음성인식으로 바꿨어요. 마이크를 눌러 다시 말해 주세요.',
+                  );
+                }}
+              >
+                기기 음성인식으로 바꾸기
+              </button>
+            )}
           </div>
           <div className="flex h-12 gap-2">
             <button
               type="button"
-              disabled={listening || assistantBusy}
+              disabled={listening || voiceBusy || cloudPhase === 'starting'}
               className={
                 'min-h-12 flex-1 rounded-xl text-sm font-semibold text-[#1B64DA]' +
-                (listening || assistantBusy ? ' invisible' : '')
+                (listening || voiceBusy || cloudPhase === 'starting'
+                  ? ' invisible'
+                  : '')
               }
               onClick={() => setTapToTalk((value) => !value)}
             >
@@ -2408,10 +2689,12 @@ export default function BusApp() {
             </button>
             <button
               type="button"
-              disabled={listening || assistantBusy}
+              disabled={listening || voiceBusy || cloudPhase === 'starting'}
               className={
                 'min-h-12 rounded-xl px-3 text-sm font-semibold text-[#1B64DA]' +
-                (listening || assistantBusy ? ' invisible' : '')
+                (listening || voiceBusy || cloudPhase === 'starting'
+                  ? ' invisible'
+                  : '')
               }
               onClick={() => {
                 if (assistantCloseTimerRef.current !== null)
@@ -2609,8 +2892,8 @@ export default function BusApp() {
           </DialogHeader>
           <div className="space-y-7 pb-1">
             <p className="text-sm leading-5 text-[#647184]">
-              음성은 브라우저에서 글로 바꿔요. AI 문장 해석이 연결되면 말한 글이
-              OpenAI로 전송돼요. 앱에서 녹음 파일을 별도로 저장하지 않아요.
+              AI 기능을 사용하면 녹음과 인식된 글은 Cloudflare로, 읽을 안내
+              문장은 Google로 보내요. 앱에서 음성 파일을 별도로 저장하지 않아요.
             </p>
             <div className="space-y-3">
               <div className="flex min-h-14 items-center justify-between gap-3 px-1 text-sm font-semibold">
@@ -2704,11 +2987,11 @@ export default function BusApp() {
             <div className="rounded-2xl bg-[#F7F8FA] p-5">
               <div className="flex items-start justify-between gap-3">
                 <div>
-                  <label htmlFor="voice-choice" className="font-semibold">
-                    안내 음성
-                  </label>
+                  <p className="font-semibold">안내 음성 · Gemini</p>
                   <p className="mt-0.5 text-sm font-normal text-[#6B7684]">
-                    기기의 한국어 음성을 사용해요
+                    {cloudTtsEnabled
+                      ? 'Gemini가 읽어줘요. 안내 문장을 Google로 보내요. 무료 등급에서는 제품 개선에 사용될 수 있어요.'
+                      : 'Gemini 음성 연결이 필요해요. 안내는 화면에서도 볼 수 있어요.'}
                   </p>
                 </div>
                 <Volume2
@@ -2716,24 +2999,6 @@ export default function BusApp() {
                   className="mt-1 size-5 text-[#2165D6]"
                 />
               </div>
-              <select
-                id="voice-choice"
-                value={settings.voiceURI}
-                onChange={(event) =>
-                  setSettings((current) => ({
-                    ...current,
-                    voiceURI: event.target.value,
-                  }))
-                }
-                className="mt-3 min-h-14 w-full rounded-xl border-0 bg-[#F2F4F6] px-3 text-base font-semibold"
-              >
-                <option value="">자동 · 기기 추천 음성</option>
-                {koreanVoiceOptions.map((voice) => (
-                  <option key={voice.voiceURI} value={voice.voiceURI}>
-                    {voice.name}
-                  </option>
-                ))}
-              </select>
               <fieldset className="mt-4">
                 <legend className="text-sm font-semibold">읽는 속도</legend>
                 <div className="mt-2 grid grid-cols-3 gap-2">
@@ -2773,14 +3038,32 @@ export default function BusApp() {
                 variant="outline"
                 className="mt-4 h-12 w-full rounded-xl border-0 bg-[#F2F4F6] font-semibold text-[#333D4B]"
                 onClick={() =>
-                  announce(
-                    '안녕하세요. 서두르지 않아도 괜찮아요. 출발할 시간을 편안하게 알려드릴게요.',
-                  )
+                  speechBusy
+                    ? speechPlayerRef.current?.stop()
+                    : announce(
+                        '안녕하세요. 서두르지 않아도 괜찮아요. 출발할 시간을 편안하게 알려드릴게요.',
+                      )
                 }
               >
                 <Volume2 aria-hidden="true" />
-                미리 듣기
+                {speechState.phase === 'loading'
+                  ? '음성 준비 취소'
+                  : speechBusy
+                    ? '음성 멈추기'
+                    : '미리 듣기'}
               </Button>
+              {speechBusy && (
+                <output className="mt-2 block text-sm text-[#647184]">
+                  {speechState.phase === 'loading'
+                    ? '안내 음성을 만들고 있어요.'
+                    : 'Gemini 음성으로 안내하고 있어요.'}
+                </output>
+              )}
+              {speechError && (
+                <output className="mt-2 block text-sm text-[#647184]">
+                  {speechError}
+                </output>
+              )}
             </div>
 
             <div className="space-y-2">

@@ -1,12 +1,16 @@
-import { NextResponse } from 'next/server';
-
 import {
   createDemoTrip,
   demoPlaces,
   type Place,
   type TripPlan,
-  type TripStop,
-} from '@/lib/trip-planning';
+} from '../../../lib/trip-planning.ts';
+import { createTagoClient, type TagoClient } from '../../../lib/tago-client.ts';
+import {
+  findTagoRouteMatch,
+  normalizeStopName,
+} from '../../../lib/tago-route-match.ts';
+
+export const maxDuration = 30;
 
 type KakaoStop = { name?: unknown };
 type KakaoVehicle = { name?: unknown; type?: unknown };
@@ -34,23 +38,10 @@ type KakaoTransitResponse = {
   routes?: KakaoRoute[];
 };
 
-type TagoStop = {
-  id: string;
-  name: string;
-  cityCode: string;
-  latitude: number;
-  longitude: number;
-};
-
 function toText(value: unknown) {
   return typeof value === 'string' || typeof value === 'number'
     ? String(value).trim()
     : '';
-}
-
-function toList(value: unknown): Record<string, unknown>[] {
-  if (!value) return [];
-  return Array.isArray(value) ? value : [value as Record<string, unknown>];
 }
 
 function firstNumber(searchParams: URLSearchParams, names: string[]) {
@@ -124,119 +115,19 @@ function placeFromRequest(
   };
 }
 
-function normalizeStopName(name: string) {
-  return name.normalize('NFKC').replace(/[\s.,·()[\]{}\-_/]/g, '');
-}
-
-function distanceInMeters(
-  firstLatitude: number,
-  firstLongitude: number,
-  secondLatitude: number,
-  secondLongitude: number,
-) {
-  const radians = (degrees: number) => (degrees * Math.PI) / 180;
-  const earthRadius = 6_371_000;
-  const latitudeDistance = radians(secondLatitude - firstLatitude);
-  const longitudeDistance = radians(secondLongitude - firstLongitude);
-  const value =
-    Math.sin(latitudeDistance / 2) ** 2 +
-    Math.cos(radians(firstLatitude)) *
-      Math.cos(radians(secondLatitude)) *
-      Math.sin(longitudeDistance / 2) ** 2;
-  return Math.round(
-    earthRadius * 2 * Math.atan2(Math.sqrt(value), Math.sqrt(1 - value)),
-  );
-}
-
-function firstPoint(step: KakaoStep): [number, number] | null {
+function stepPoint(step: KakaoStep, index: number): [number, number] | null {
   const points = step.path?.points;
-  if (!Array.isArray(points) || !Array.isArray(points[0])) return null;
-  const longitude = Number(points[0][0]);
-  const latitude = Number(points[0][1]);
-  return isWgs84(latitude, longitude) ? [longitude, latitude] : null;
-}
-
-async function findTagoBoardingStop(
-  stopName: string,
-  point: [number, number] | null,
-): Promise<TripStop | null> {
-  const apiKey = process.env.TAGO_BUS_API_KEY;
-  if (!apiKey || !point) return null;
-
-  try {
-    const [longitude, latitude] = point;
-    const apiUrl = new URL(
-      'https://apis.data.go.kr/1613000/BusSttnInfoInqireService/getCrdntPrxmtSttnList',
-    );
-    apiUrl.searchParams.set('serviceKey', apiKey);
-    apiUrl.searchParams.set('gpsLati', String(latitude));
-    apiUrl.searchParams.set('gpsLong', String(longitude));
-    apiUrl.searchParams.set('_type', 'json');
-    apiUrl.searchParams.set('numOfRows', '20');
-    apiUrl.searchParams.set('pageNo', '1');
-
-    const response = await fetch(apiUrl, {
-      headers: { Accept: 'application/json' },
-      cache: 'no-store',
-      signal: AbortSignal.timeout(7_000),
-    });
-    if (!response.ok) return null;
-
-    const payload = (await response.json()) as {
-      response?: { body?: { items?: { item?: unknown } } };
-    };
-    const normalizedTarget = normalizeStopName(stopName);
-    const candidates = toList(payload.response?.body?.items?.item)
-      .map((item): TagoStop | null => {
-        const id = toText(item.nodeid);
-        const name = toText(item.nodenm);
-        const cityCode = toText(item.citycode);
-        const stopLatitude = Number(item.gpslati);
-        const stopLongitude = Number(item.gpslong);
-        if (
-          !id ||
-          !name ||
-          !cityCode ||
-          !Number.isFinite(stopLatitude) ||
-          !Number.isFinite(stopLongitude) ||
-          normalizeStopName(name) !== normalizedTarget
-        ) {
-          return null;
-        }
-        return {
-          id,
-          name,
-          cityCode,
-          latitude: stopLatitude,
-          longitude: stopLongitude,
-        };
-      })
-      .filter((stop): stop is TagoStop => stop !== null)
-      .map((stop) => ({
-        stop,
-        distance: distanceInMeters(
-          latitude,
-          longitude,
-          stop.latitude,
-          stop.longitude,
-        ),
-      }))
-      .sort((first, second) => first.distance - second.distance);
-
-    const best = candidates[0];
-    const runnerUp = candidates[1];
-    const isCloseEnough = best && best.distance <= 120;
-    const isUnambiguous = !runnerUp || runnerUp.distance > 120;
-    if (!best || !isCloseEnough || !isUnambiguous) return null;
-
-    return {
-      id: best.stop.id,
-      name: stopName,
-      cityCode: best.stop.cityCode,
-    };
-  } catch {
+  if (!Array.isArray(points)) return null;
+  const point = points.at(index);
+  if (
+    !Array.isArray(point) ||
+    point.length < 2 ||
+    point.some((value) => value === null || value === '')
+  )
     return null;
-  }
+  const longitude = Number(point[0]);
+  const latitude = Number(point[1]);
+  return isWgs84(latitude, longitude) ? [longitude, latitude] : null;
 }
 
 function routeName(step: KakaoStep) {
@@ -257,6 +148,7 @@ function createKakaoFallbackStopId(
 
 async function normalizeDirectBusTrip(
   payload: KakaoTransitResponse,
+  tago: TagoClient | null,
   routeIndex = 0,
 ): Promise<TripPlan | null> {
   if (toText(payload.status) !== 'OK') return null;
@@ -295,41 +187,55 @@ async function normalizeDirectBusTrip(
     .slice(0, busStepIndex)
     .filter((step) => toText(step.properties?.type) === 'WALKING')
     .reduce((total, step) => total + Number(step.properties?.time || 0), 0);
-  const boardingPoint = firstPoint(selected.busStep);
-  const tagoStop = await findTagoBoardingStop(boardingStopName, boardingPoint);
+  const boardingPoint = stepPoint(selected.busStep, 0);
+  const alightingPoint = stepPoint(selected.busStep, -1);
+  const tagoMatch =
+    tago && boardingPoint && alightingPoint
+      ? await findTagoRouteMatch(tago, {
+          route: busRouteName,
+          stopNames: stops.map((stop) => toText(stop.name)),
+          boardingPoint,
+          alightingPoint,
+        })
+      : null;
 
   return {
-    id: `kakao:${busRouteName}:${boardingStopName}:${alightingStopName}`,
+    id: `kakao:${busRouteName}:${boardingStopName}:${alightingStopName}:${tagoMatch?.boardingStop.id ?? ''}`,
     route: busRouteName,
+    routeId: tagoMatch?.routeId,
     direction: `${alightingStopName} 방향`,
+    nextStopName: tagoMatch?.nextStopName,
     totalMinutes: Math.max(1, Math.ceil(selected.totalTime / 60)),
     walkToStopMinutes:
       walkToStopSeconds > 0 ? Math.ceil(walkToStopSeconds / 60) : 0,
     transfers: selected.transfers,
-    boardingStop: tagoStop ?? {
+    boardingStop: tagoMatch?.boardingStop ?? {
       id: createKakaoFallbackStopId(boardingStopName, boardingPoint),
       name: boardingStopName,
+      ...(boardingPoint
+        ? { longitude: boardingPoint[0], latitude: boardingPoint[1] }
+        : {}),
     },
     alightingStop: { name: alightingStopName },
     landingUrl:
       toText(payload.properties?.landingURL) ||
       toText(payload.properties?.landingUrl) ||
       undefined,
-    arrivalLookupAvailable: Boolean(tagoStop),
+    arrivalLookupAvailable: Boolean(tagoMatch),
   };
 }
 
 function demoResponse(origin: Place | null, destination: Place | null) {
   const fallbackOrigin = origin ?? demoPlaces[0];
   const fallbackDestination = destination ?? demoPlaces[1];
-  return NextResponse.json({
+  return Response.json({
     mode: 'demo',
     trip: createDemoTrip(fallbackOrigin, fallbackDestination),
   });
 }
 
 function unavailableResponse(notice: string) {
-  return NextResponse.json({
+  return Response.json({
     mode: 'unavailable',
     trip: null,
     notice,
@@ -343,7 +249,7 @@ export async function GET(request: Request) {
   const apiKey = process.env.KAKAO_REST_API_KEY;
 
   if (!origin || !destination) {
-    return NextResponse.json(
+    return Response.json(
       {
         mode: 'unavailable',
         trip: null,
@@ -397,14 +303,23 @@ export async function GET(request: Request) {
         Authorization: `KakaoAK ${apiKey}`,
       },
       cache: 'no-store',
-      signal: AbortSignal.timeout(7_000),
+      signal: AbortSignal.any([request.signal, AbortSignal.timeout(7_000)]),
     });
     if (!response.ok) throw new Error('Kakao public transit request failed');
 
     const payload = (await response.json()) as KakaoTransitResponse;
+    const tago = process.env.TAGO_BUS_API_KEY
+      ? createTagoClient({
+          apiKey: process.env.TAGO_BUS_API_KEY,
+          signal: AbortSignal.any([
+            request.signal,
+            AbortSignal.timeout(15_000),
+          ]),
+        })
+      : null;
     const trips = (
       await Promise.all(
-        [0, 1, 2].map((index) => normalizeDirectBusTrip(payload, index)),
+        [0, 1, 2].map((index) => normalizeDirectBusTrip(payload, tago, index)),
       )
     )
       .filter((trip): trip is TripPlan => trip !== null)
@@ -420,7 +335,7 @@ export async function GET(request: Request) {
       );
     }
 
-    return NextResponse.json({
+    return Response.json({
       mode: 'live',
       trip,
       alternatives: trips.filter((candidate) => candidate.id !== trip.id),

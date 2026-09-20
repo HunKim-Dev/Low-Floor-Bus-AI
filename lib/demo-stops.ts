@@ -3,6 +3,7 @@ export type TransitStop = {
   name: string;
   direction: string;
   route: string;
+  routeId?: string;
   cityCode?: string;
   distanceMeters?: number;
 };

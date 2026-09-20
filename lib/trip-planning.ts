@@ -11,12 +11,18 @@ export type TripStop = {
   id: string;
   name: string;
   cityCode?: string;
+  // Public stop/sign number, never TAGO's internal node ID or route order.
+  number?: string;
+  latitude?: number;
+  longitude?: number;
 };
 
 export type TripPlan = {
   id: string;
   route: string;
+  routeId?: string;
   direction: string;
+  nextStopName?: string;
   totalMinutes: number;
   walkToStopMinutes: number;
   transfers: number;
